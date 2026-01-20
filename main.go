@@ -235,11 +235,11 @@ func postMessageToDiscord(alertManagerData *AlertManagerData, status string, col
 		log.Printf("Posting to primary webhook: %s", *webhookURL)
 		log.Printf("Payload: %s", string(discordMessageBytes))
 	}
-	status, respBody, err := sendToWebhook(*webhookURL, discordMessageBytes)
+	httpStatus, respBody, err := sendToWebhook(*webhookURL, discordMessageBytes)
 	if err != nil {
 		log.Printf("error sending to primary webhook: %v", err)
 	}
-	if dumpFull && status >= 400 {
+	if dumpFull && httpStatus >= 400 {
 		// If Discord complains about embeds we can try isolating which embed fails
 		if bytes.Contains(respBody, []byte("\"embeds\"")) {
 			log.Printf("Attempting embed isolation diagnostics for primary webhook")
@@ -251,11 +251,11 @@ func postMessageToDiscord(alertManagerData *AlertManagerData, status string, col
 			log.Printf("Posting to additional webhook: %s", webhook)
 			log.Printf("Payload: %s", string(discordMessageBytes))
 		}
-		status, respBody, err := sendToWebhook(webhook, discordMessageBytes)
+		addStatus, respBody, err := sendToWebhook(webhook, discordMessageBytes)
 		if err != nil {
 			log.Printf("error sending to additional webhook %s: %v", webhook, err)
 		}
-		if dumpFull && status >= 400 {
+		if dumpFull && addStatus >= 400 {
 			if bytes.Contains(respBody, []byte("\"embeds\"")) {
 				log.Printf("Attempting embed isolation diagnostics for additional webhook %s", webhook)
 				debugIsolateEmbeds(webhook, discordMessageBytes, discordMessage.Embeds)
