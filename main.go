@@ -229,13 +229,30 @@ func postMessageToDiscord(alertManagerData *AlertManagerData, status string, col
 	if *verboseMode == "ON" || *verboseMode == "true" {
 		log.Printf("Sending webhook message to Discord: %s", string(discordMessageBytes))
 	}
+	// If DUMP_ENVS_FULL is set, print the webhook URL(s) and full payload for debugging
+	dumpFull := os.Getenv("DUMP_ENVS_FULL") == "true" || os.Getenv("DUMP_ENVS_FULL") == "1"
+	if dumpFull {
+		log.Printf("Posting to primary webhook: %s", *webhookURL)
+		log.Printf("Payload: %s", string(discordMessageBytes))
+	}
 	sendToWebhook(*webhookURL, discordMessageBytes)
 	for _, webhook := range additionalWebhookURLs {
+		if dumpFull {
+			log.Printf("Posting to additional webhook: %s", webhook)
+			log.Printf("Payload: %s", string(discordMessageBytes))
+		}
 		sendToWebhook(webhook, discordMessageBytes)
 	}
 }
 
 func sendToWebhook(webHook string, discordMessageBytes []byte) {
+	// If DUMP_ENVS_FULL is set, print the webhook URL and payload before sending
+	dumpFull := os.Getenv("DUMP_ENVS_FULL") == "true" || os.Getenv("DUMP_ENVS_FULL") == "1"
+	if dumpFull {
+		log.Printf("POSTing to webhook: %s", webHook)
+		log.Printf("Payload: %s", string(discordMessageBytes))
+	}
+
 	response, err := http.Post(webHook, "application/json", bytes.NewReader(discordMessageBytes))
 	if err != nil {
 		log.Printf("failed to POST to webhook: %v", err)
