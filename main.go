@@ -196,10 +196,12 @@ func sendWebhook(alertManagerData *AlertManagerData) {
 				Name:  "*Details:*",
 				Value: getFormattedLabels(alert.Labels),
 			})
-			if *username != "" {
-				footer := DiscordEmbedFooter{}
-				footer.Text = *username
-				embedAlertMessage.Footer = &footer
+		// Show the alert status explicitly (firing/resolved)
+		embedAlertMessage.Fields = append(embedAlertMessage.Fields, DiscordEmbedField{
+			Name:  "*Status:*",
+			Value: fmt.Sprintf("`%s`", alert.Status),
+			Inline: false,
+		})
 				currentTime := time.Now()
 				embedAlertMessage.Timestamp = &currentTime
 			}
@@ -230,41 +232,31 @@ func postMessageToDiscord(alertManagerData *AlertManagerData, status string, col
 		log.Printf("Sending webhook message to Discord: %s", string(discordMessageBytes))
 	}
 	// Send to primary webhook
-	httpStatus, respBody, err := sendToWebhook(*webhookURL, discordMessageBytes)
-	if err != nil {
+	if err := sendToWebhook(*webhookURL, discordMessageBytes); err != nil {
 		log.Printf("error sending to primary webhook: %v", err)
-	}
-	if httpStatus >= 400 {
-		log.Printf("Discord webhook primary responded %d: %s", httpStatus, truncateString(string(respBody), 1024))
 	}
 	// Send to additional webhooks
 	for _, webhook := range additionalWebhookURLs {
-		addStatus, respBody, err := sendToWebhook(webhook, discordMessageBytes)
-		if err != nil {
+		if err := sendToWebhook(webhook, discordMessageBytes); err != nil {
 			log.Printf("error sending to additional webhook %s: %v", webhook, err)
-		}
-		if addStatus >= 400 {
-			log.Printf("Discord webhook (additional) responded %d for %s: %s", addStatus, webhook, truncateString(string(respBody), 1024))
 		}
 	}
 }
 
-func sendToWebhook(webHook string, discordMessageBytes []byte) (int, []byte, error) {
+func sendToWebhook(webHook string, discordMessageBytes []byte) error {
 	response, err := http.Post(webHook, "application/json", bytes.NewReader(discordMessageBytes))
 	if err != nil {
-		log.Printf("failed to POST to webhook: %v", err)
-		return 0, nil, err
+		return fmt.Errorf("failed to POST to webhook %s: %w", webHook, err)
 	}
 	defer response.Body.Close()
 
 	if response.StatusCode >= 200 && response.StatusCode < 300 {
-		return response.StatusCode, nil, nil
+		return nil
 	}
 
 	responseData, err := ioutil.ReadAll(response.Body)
 	if err != nil {
-		log.Printf("failed to read response body: %v", err)
-		return response.StatusCode, nil, err
+		return fmt.Errorf("failed to read response body: %w", err)
 	}
 
 	// Collect useful headers for diagnostics
@@ -308,18 +300,12 @@ func sendToWebhook(webHook string, discordMessageBytes []byte) (int, []byte, err
 			log.Printf("Webhook message to Discord failed (%d)%s: %s", response.StatusCode, headerInfo, truncateString(string(responseData), 1024))
 		}
 	}
-	return response.StatusCode, responseData, nil
+	return fmt.Errorf("discord webhook returned status %d", response.StatusCode)
 }
 
 func buildDiscordMessage(alertManagerData *AlertManagerData, status string, numberOfAlerts int, color int) DiscordMessage {
 	discordMessage := DiscordMessage{}
 	addOverrideFields(&discordMessage)
-	// Set a short machine-friendly content prefix to indicate resolved vs firing
-	if status == "resolved" {
-		discordMessage.Content = fmt.Sprintf("resolve: %s", getAlertName(alertManagerData))
-	} else if status == "firing" {
-		discordMessage.Content = fmt.Sprintf("alert: %s", getAlertName(alertManagerData))
-	}
 	messageHeader := DiscordEmbed{
 		Title:  fmt.Sprintf("[%s:%d] %s", strings.ToUpper(status), numberOfAlerts, getAlertName(alertManagerData)),
 		URL:    alertManagerData.ExternalURL,
@@ -400,28 +386,6 @@ func truncateString(s string, max int) string {
 }
 
 
-// validateUsername checks an optional username for Discord webhooks.
-// Allowed: empty (optional), or a single-line string of reasonable length (<=80 chars).
-func validateUsername(name string) bool {
-	if name == "" {
-		return true
-	}
-	if strings.ContainsAny(name, "\r\n") {
-		return false
-	}
-	if len(name) > 80 {
-		return false
-	}
-	return true
-}
-
-// validateAvatarURL ensures the optional avatar URL is a valid http(s) URL.
-func validateAvatarURL(u string) bool {
-	if u == "" {
-		return true
-	}
-	return isValidHTTPURL(u)
-}
 
 func addOverrideFields(discordMessage *DiscordMessage) {
 	if *username != "" {
@@ -524,23 +488,32 @@ func sendRawPromAlertWarn() {
 
 func main() {
 	flag.Parse()
-	// Validate mandatory/optional configuration
-	if !checkWebhookURL(*webhookURL) {
-		log.Fatalf("Discord webhook not provided or invalid. Set DISCORD_WEBHOOK or --webhook.url with a valid Discord webhook URL.")
-	}
-	// Validate additional webhooks
+	// Check required webhook URL
+	checkWebhookURL(*webhookURL)
+	// Validate and collect additional webhooks
 	for _, additionalWebhook := range strings.Split(*additionalWebhookURLFlag, ",") {
 		if isNotBlankOrEmpty(additionalWebhook) && checkWebhookURL(additionalWebhook) {
 			additionalWebhookURLs = append(additionalWebhookURLs, additionalWebhook)
 		}
 	}
-	// Validate optional username and avatar URL
-	if !validateUsername(*username) {
-		log.Fatalf("DISCORD_USERNAME is invalid: must be a single-line string <= 80 chars")
+	// Username is optional - warn if missing, truncate if too long
+	if *username == "" {
+		log.Printf("No Discord username override set; webhook default will be used")
+	} else {
+		if len(*username) > 80 {
+			log.Printf("Discord username override is too long; truncating to 80 chars")
+			*username = truncateString(*username, 80)
+		}
 	}
-	if !validateAvatarURL(*avatarURL) {
-		log.Fatalf("DISCORD_AVATAR_URL doesn't appear to be a valid http(s) URL")
+	// Avatar URL is optional - validate scheme if provided
+	if *avatarURL != "" {
+		if !isValidHTTPURL(*avatarURL) {
+			log.Printf("Discord avatar URL appears invalid; ignoring: %s", *avatarURL)
+			*avatarURL = ""
+		}
 	}
+
+	checkDiscordUserName(*username)
 
 	if *listenAddress == "" {
 		*listenAddress = defaultListenAddress
