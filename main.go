@@ -238,31 +238,51 @@ func postMessageToDiscord(alertManagerData *AlertManagerData, status string, col
 		log.Printf("Sending webhook message to Discord: %s", string(discordMessageBytes))
 	}
 	// Send to primary webhook
-	if err := sendToWebhook(*webhookURL, discordMessageBytes); err != nil {
+	httpStatus, respBody, err := sendToWebhook(*webhookURL, discordMessageBytes)
+	if err != nil {
 		log.Printf("error sending to primary webhook: %v", err)
+	}
+	// If Discord indicated an embed error (example body contains '"embeds"') and isolation is enabled, try to isolate failing embed
+	if httpStatus >= 400 && bytes.Contains(respBody, []byte("\"embeds\"")) {
+		if os.Getenv("ENABLE_EMBED_ISOLATION") == "true" {
+			log.Printf("Embed error detected; running embed isolation (ENABLE_EMBED_ISOLATION=true)")
+			debugIsolateEmbeds(*webhookURL, discordMessage.Embeds)
+		} else {
+			log.Printf("Embed error detected; set ENABLE_EMBED_ISOLATION=true to attempt isolation diagnostics")
+		}
 	}
 	// Send to additional webhooks
 	for _, webhook := range additionalWebhookURLs {
-		if err := sendToWebhook(webhook, discordMessageBytes); err != nil {
+		addStatus, respBody, err := sendToWebhook(webhook, discordMessageBytes)
+		if err != nil {
 			log.Printf("error sending to additional webhook %s: %v", webhook, err)
+		}
+		if addStatus >= 400 && bytes.Contains(respBody, []byte("\"embeds\"")) {
+			if os.Getenv("ENABLE_EMBED_ISOLATION") == "true" {
+				log.Printf("Embed error detected on additional webhook %s; running embed isolation (ENABLE_EMBED_ISOLATION=true)", webhook)
+				debugIsolateEmbeds(webhook, discordMessage.Embeds)
+			} else {
+				log.Printf("Embed error detected on additional webhook %s; set ENABLE_EMBED_ISOLATION=true to attempt isolation diagnostics", webhook)
+			}
 		}
 	}
 }
 
-func sendToWebhook(webHook string, discordMessageBytes []byte) error {
+func sendToWebhook(webHook string, discordMessageBytes []byte) (int, []byte, error) {
 	response, err := http.Post(webHook, "application/json", bytes.NewReader(discordMessageBytes))
 	if err != nil {
-		return fmt.Errorf("failed to POST to webhook %s: %w", webHook, err)
+		return 0, nil, fmt.Errorf("failed to POST to webhook %s: %w", webHook, err)
 	}
 	defer response.Body.Close()
 
-	if response.StatusCode >= 200 && response.StatusCode < 300 {
-		return nil
-	}
-
 	responseData, err := ioutil.ReadAll(response.Body)
 	if err != nil {
-		return fmt.Errorf("failed to read response body: %w", err)
+		return response.StatusCode, nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	// Success if 2xx
+	if response.StatusCode >= 200 && response.StatusCode < 300 {
+		return response.StatusCode, responseData, nil
 	}
 
 	// Collect useful headers for diagnostics
@@ -306,7 +326,7 @@ func sendToWebhook(webHook string, discordMessageBytes []byte) error {
 			log.Printf("Webhook message to Discord failed (%d)%s: %s", response.StatusCode, headerInfo, truncateString(string(responseData), 1024))
 		}
 	}
-	return fmt.Errorf("discord webhook returned status %d", response.StatusCode)
+	return response.StatusCode, responseData, fmt.Errorf("discord webhook returned status %d", response.StatusCode)
 }
 
 func buildDiscordMessage(alertManagerData *AlertManagerData, status string, numberOfAlerts int, color int) DiscordMessage {
@@ -389,6 +409,26 @@ func truncateString(s string, max int) string {
 		return s[:max]
 	}
 	return s[:max-3] + "..."
+}
+
+// debugIsolateEmbeds will attempt to send each embed individually to the webhook and log the results.
+// Note: this will post one message per embed to the provided webhook. It only runs when ENABLE_EMBED_ISOLATION=true
+func debugIsolateEmbeds(webhook string, embeds DiscordEmbeds) {
+	for i, em := range embeds {
+		testMsg := DiscordMessage{}
+		addOverrideFields(&testMsg)
+		testMsg.Embeds = DiscordEmbeds{em}
+		testBytes, _ := json.Marshal(testMsg)
+		log.Printf("[embed isolation] Posting single embed index %d to %s", i, webhook)
+		status, respBody, err := sendToWebhook(webhook, testBytes)
+		if err != nil {
+			log.Printf("[embed isolation] POST error for embed %d: %v", i, err)
+		} else {
+			log.Printf("[embed isolation] embed %d -> status=%d, resp=%s", i, status, truncateString(string(respBody), 1024))
+		}
+		// Sleep briefly to avoid triggering rate limits
+		time.Sleep(500 * time.Millisecond)
+	}
 }
 
 
