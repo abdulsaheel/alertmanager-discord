@@ -90,10 +90,10 @@ type DiscordEmbedFooter struct {
 }
 
 type DiscordMessage struct {
-	Content   string        `json:"content"`
-	Username  string        `json:"username"`
-	AvatarURL string        `json:"avatar_url"`
-	Embeds    DiscordEmbeds `json:"embeds"`
+	Content   string        `json:"content,omitempty"`
+	Username  string        `json:"username,omitempty"`
+	AvatarURL string        `json:"avatar_url,omitempty"`
+	Embeds    DiscordEmbeds `json:"embeds,omitempty"`
 }
 
 type DiscordEmbeds []DiscordEmbed
