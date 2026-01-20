@@ -196,12 +196,18 @@ func sendWebhook(alertManagerData *AlertManagerData) {
 				Name:  "*Details:*",
 				Value: getFormattedLabels(alert.Labels),
 			})
-		// Show the alert status explicitly (firing/resolved)
-		embedAlertMessage.Fields = append(embedAlertMessage.Fields, DiscordEmbedField{
-			Name:  "*Status:*",
-			Value: fmt.Sprintf("`%s`", alert.Status),
-			Inline: false,
-		})
+
+			// Include the alert status (firing/resolved) so it's always visible in the embed
+			embedAlertMessage.Fields = append(embedAlertMessage.Fields, DiscordEmbedField{
+				Name:   "*Status:*",
+				Value:  fmt.Sprintf("`%s`", alert.Status),
+				Inline: true,
+			})
+
+			if *username != "" {
+				footer := DiscordEmbedFooter{}
+				footer.Text = *username
+				embedAlertMessage.Footer = &footer
 				currentTime := time.Now()
 				embedAlertMessage.Timestamp = &currentTime
 			}
