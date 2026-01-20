@@ -229,49 +229,27 @@ func postMessageToDiscord(alertManagerData *AlertManagerData, status string, col
 	if *verboseMode == "ON" || *verboseMode == "true" {
 		log.Printf("Sending webhook message to Discord: %s", string(discordMessageBytes))
 	}
-	// If DUMP_ENVS_FULL is set, print the webhook URL(s) and full payload for debugging
-	dumpFull := os.Getenv("DUMP_ENVS_FULL") == "true" || os.Getenv("DUMP_ENVS_FULL") == "1"
-	if dumpFull {
-		log.Printf("Posting to primary webhook: %s", *webhookURL)
-		log.Printf("Payload: %s", string(discordMessageBytes))
-	}
+	// Send to primary webhook
 	httpStatus, respBody, err := sendToWebhook(*webhookURL, discordMessageBytes)
 	if err != nil {
 		log.Printf("error sending to primary webhook: %v", err)
 	}
-	if dumpFull && httpStatus >= 400 {
-		// If Discord complains about embeds we can try isolating which embed fails
-		if bytes.Contains(respBody, []byte("\"embeds\"")) {
-			log.Printf("Attempting embed isolation diagnostics for primary webhook")
-			debugIsolateEmbeds(*webhookURL, discordMessageBytes, discordMessage.Embeds)
-		}
+	if httpStatus >= 400 {
+		log.Printf("Discord webhook primary responded %d: %s", httpStatus, truncateString(string(respBody), 1024))
 	}
+	// Send to additional webhooks
 	for _, webhook := range additionalWebhookURLs {
-		if dumpFull {
-			log.Printf("Posting to additional webhook: %s", webhook)
-			log.Printf("Payload: %s", string(discordMessageBytes))
-		}
 		addStatus, respBody, err := sendToWebhook(webhook, discordMessageBytes)
 		if err != nil {
 			log.Printf("error sending to additional webhook %s: %v", webhook, err)
 		}
-		if dumpFull && addStatus >= 400 {
-			if bytes.Contains(respBody, []byte("\"embeds\"")) {
-				log.Printf("Attempting embed isolation diagnostics for additional webhook %s", webhook)
-				debugIsolateEmbeds(webhook, discordMessageBytes, discordMessage.Embeds)
-			}
+		if addStatus >= 400 {
+			log.Printf("Discord webhook (additional) responded %d for %s: %s", addStatus, webhook, truncateString(string(respBody), 1024))
 		}
 	}
 }
 
 func sendToWebhook(webHook string, discordMessageBytes []byte) (int, []byte, error) {
-	// If DUMP_ENVS_FULL is set, print the webhook URL and payload before sending
-	dumpFull := os.Getenv("DUMP_ENVS_FULL") == "true" || os.Getenv("DUMP_ENVS_FULL") == "1"
-	if dumpFull {
-		log.Printf("POSTing to webhook: %s", webHook)
-		log.Printf("Payload: %s", string(discordMessageBytes))
-	}
-
 	response, err := http.Post(webHook, "application/json", bytes.NewReader(discordMessageBytes))
 	if err != nil {
 		log.Printf("failed to POST to webhook: %v", err)
@@ -336,6 +314,12 @@ func sendToWebhook(webHook string, discordMessageBytes []byte) (int, []byte, err
 func buildDiscordMessage(alertManagerData *AlertManagerData, status string, numberOfAlerts int, color int) DiscordMessage {
 	discordMessage := DiscordMessage{}
 	addOverrideFields(&discordMessage)
+	// Set a short machine-friendly content prefix to indicate resolved vs firing
+	if status == "resolved" {
+		discordMessage.Content = fmt.Sprintf("resolve: %s", getAlertName(alertManagerData))
+	} else if status == "firing" {
+		discordMessage.Content = fmt.Sprintf("alert: %s", getAlertName(alertManagerData))
+	}
 	messageHeader := DiscordEmbed{
 		Title:  fmt.Sprintf("[%s:%d] %s", strings.ToUpper(status), numberOfAlerts, getAlertName(alertManagerData)),
 		URL:    alertManagerData.ExternalURL,
@@ -415,70 +399,28 @@ func truncateString(s string, max int) string {
 	return s[:max-3] + "..."
 }
 
-// debugIsolateEmbeds will attempt to send each embed individually to the webhook and log the results.
-// This is only intended for interactive debugging when DUMP_ENVS_FULL is enabled.
-func debugIsolateEmbeds(webhook string, fullPayload []byte, embeds DiscordEmbeds) {
-	for i := range embeds {
-		// Build a message with only the header and the single embed to test
-		testMsg := DiscordMessage{}
-		addOverrideFields(&testMsg)
-		// include header as empty so we can reproduce structure similar to the original
-		if len(embeds) > 0 {
-			testHeader := embeds[0]
-			testMsg.Embeds = DiscordEmbeds{testHeader}
-		}
-		// Replace the header or append the single embed we want to test
-		if len(testMsg.Embeds) > 0 {
-			testMsg.Embeds[0] = embeds[i]
-		} else {
-			testMsg.Embeds = DiscordEmbeds{embeds[i]}
-		}
-		testBytes, _ := json.Marshal(testMsg)
-		log.Printf("[embed isolation] Posting single embed index %d to %s", i, webhook)
-		log.Printf("[embed isolation] Payload: %s", string(testBytes))
-		status, respBody, err := sendToWebhook(webhook, testBytes)
-		if err != nil {
-			log.Printf("[embed isolation] POST error for embed %d: %v", i, err)
-			continue
-		}
-		log.Printf("[embed isolation] embed %d -> status=%d, resp=%s", i, status, truncateString(string(respBody), 1024))
-		// Sleep briefly to avoid triggering rate limits
-		time.Sleep(500 * time.Millisecond)
+
+// validateUsername checks an optional username for Discord webhooks.
+// Allowed: empty (optional), or a single-line string of reasonable length (<=80 chars).
+func validateUsername(name string) bool {
+	if name == "" {
+		return true
 	}
+	if strings.ContainsAny(name, "\r\n") {
+		return false
+	}
+	if len(name) > 80 {
+		return false
+	}
+	return true
 }
 
-// sensitiveEnv returns true if the env var name looks sensitive and should be redacted
-func sensitiveEnv(name string) bool {
-	name = strings.ToUpper(name)
-	sensitiveKeywords := []string{"TOKEN", "KEY", "SECRET", "PASSWORD", "PASS", "WEBHOOK"}
-	for _, k := range sensitiveKeywords {
-		if strings.Contains(name, k) {
-			return true
-		}
+// validateAvatarURL ensures the optional avatar URL is a valid http(s) URL.
+func validateAvatarURL(u string) bool {
+	if u == "" {
+		return true
 	}
-	return false
-}
-
-// logEnvVars logs all environment variables. Sensitive values are redacted by default.
-// To see full values, set DUMP_ENVS_FULL=true in the environment (use with caution).
-func logEnvVars() {
-	envs := os.Environ()
-	full := os.Getenv("DUMP_ENVS_FULL") == "true" || os.Getenv("DUMP_ENVS_FULL") == "1"
-	log.Printf("Environment variables (sensitive values redacted; set DUMP_ENVS_FULL=true to show full values). Count: %d", len(envs))
-	for _, e := range envs {
-		parts := strings.SplitN(e, "=", 2)
-		k := parts[0]
-		v := ""
-		if len(parts) > 1 {
-			v = parts[1]
-		}
-		if full || !sensitiveEnv(k) {
-			log.Printf("ENV %s=%s", k, v)
-		} else {
-			red := fmt.Sprintf("<redacted len=%d prefix=%s>", len(v), truncateString(v, 4))
-			log.Printf("ENV %s=%s", k, red)
-		}
-	}
+	return isValidHTTPURL(u)
 }
 
 func addOverrideFields(discordMessage *DiscordMessage) {
@@ -582,15 +524,23 @@ func sendRawPromAlertWarn() {
 
 func main() {
 	flag.Parse()
-	// Log environment variables for debugging. Sensitive values are redacted unless DUMP_ENVS_FULL=true
-	logEnvVars()
-	checkWebhookURL(*webhookURL)
+	// Validate mandatory/optional configuration
+	if !checkWebhookURL(*webhookURL) {
+		log.Fatalf("Discord webhook not provided or invalid. Set DISCORD_WEBHOOK or --webhook.url with a valid Discord webhook URL.")
+	}
+	// Validate additional webhooks
 	for _, additionalWebhook := range strings.Split(*additionalWebhookURLFlag, ",") {
 		if isNotBlankOrEmpty(additionalWebhook) && checkWebhookURL(additionalWebhook) {
 			additionalWebhookURLs = append(additionalWebhookURLs, additionalWebhook)
 		}
 	}
-	checkDiscordUserName(*username)
+	// Validate optional username and avatar URL
+	if !validateUsername(*username) {
+		log.Fatalf("DISCORD_USERNAME is invalid: must be a single-line string <= 80 chars")
+	}
+	if !validateAvatarURL(*avatarURL) {
+		log.Fatalf("DISCORD_AVATAR_URL doesn't appear to be a valid http(s) URL")
+	}
 
 	if *listenAddress == "" {
 		*listenAddress = defaultListenAddress
