@@ -99,11 +99,11 @@ type DiscordMessage struct {
 type DiscordEmbeds []DiscordEmbed
 
 type DiscordEmbed struct {
-	Title       string              `json:"title"`
-	Description string              `json:"description"`
-	URL         string              `json:"url"`
-	Color       int                 `json:"color"`
-	Fields      DiscordEmbedFields  `json:"fields"`
+	Title       string              `json:"title,omitempty"`
+	Description string              `json:"description,omitempty"`
+	URL         string              `json:"url,omitempty"`
+	Color       int                 `json:"color,omitempty"`
+	Fields      DiscordEmbedFields  `json:"fields,omitempty"`
 	Footer      *DiscordEmbedFooter `json:"footer,omitempty"`
 	Timestamp   *time.Time          `json:"timestamp,omitempty"`
 }
@@ -223,6 +223,8 @@ func sendWebhook(alertManagerData *AlertManagerData) {
 func postMessageToDiscord(alertManagerData *AlertManagerData, status string, color int, embeds DiscordEmbeds) {
 	discordMessage := buildDiscordMessage(alertManagerData, status, len(embeds), color)
 	discordMessage.Embeds = append(discordMessage.Embeds, embeds...)
+	// Enforce Discord limits and sanitize content to avoid API rejections
+	discordMessage.Embeds = sanitizeEmbeds(discordMessage.Embeds)
 	discordMessageBytes, _ := json.Marshal(discordMessage)
 	if *verboseMode == "ON" || *verboseMode == "true" {
 		log.Printf("Sending webhook message to Discord: %s", string(discordMessageBytes))
@@ -236,16 +238,33 @@ func postMessageToDiscord(alertManagerData *AlertManagerData, status string, col
 func sendToWebhook(webHook string, discordMessageBytes []byte) {
 	response, err := http.Post(webHook, "application/json", bytes.NewReader(discordMessageBytes))
 	if err != nil {
-		log.Printf(fmt.Sprint(err))
+		log.Printf("failed to POST to webhook %s: %v", webHook, err)
+		return
 	}
+	defer response.Body.Close()
 	// Success is indicated with 2xx status codes:
 	statusOK := response.StatusCode >= 200 && response.StatusCode < 300
 	if !statusOK {
 		responseData, err := ioutil.ReadAll(response.Body)
 		if err != nil {
-			log.Printf(fmt.Sprint(err))
+			log.Printf("failed to read response body: %v", err)
+			return
 		}
-		log.Printf("Webhook message to Discord failed: %s", string(responseData))
+		// Try to parse discord JSON error to give actionable message
+		var discordErr map[string]interface{}
+		if err := json.Unmarshal(responseData, &discordErr); err == nil {
+			msg := ""
+			if m, ok := discordErr["message"].(string); ok {
+				msg = m
+			}
+			if e, ok := discordErr["errors"]; ok {
+				log.Printf("Webhook message to Discord failed (%d): %s - errors: %v", response.StatusCode, msg, e)
+			} else {
+				log.Printf("Webhook message to Discord failed (%d): %s", response.StatusCode, msg)
+			}
+		} else {
+			log.Printf("Webhook message to Discord failed (%d): %s", response.StatusCode, string(responseData))
+		}
 	}
 }
 
@@ -260,6 +279,55 @@ func buildDiscordMessage(alertManagerData *AlertManagerData, status string, numb
 	}
 	discordMessage.Embeds = DiscordEmbeds{messageHeader}
 	return discordMessage
+}
+
+// Discord limits (see docs): title <= 256, description <= 4096, fields <= 25, field name <= 256, field value <= 1024, embeds <= 10
+func sanitizeEmbeds(embeds DiscordEmbeds) DiscordEmbeds {
+	const (
+		maxEmbeds      = 10
+		maxFields      = 25
+		maxTitleLen    = 256
+		maxDescLen     = 4096
+		maxFieldName   = 256
+		maxFieldValue  = 1024
+	)
+	if len(embeds) > maxEmbeds {
+		log.Printf("sanitizing embeds: trimming %d embeds to Discord max %d", len(embeds)-maxEmbeds, maxEmbeds)
+		embeds = embeds[:maxEmbeds]
+	}
+	for i := range embeds {
+		if len(embeds[i].Title) > maxTitleLen {
+			log.Printf("sanitizing embed %d title (len=%d) to %d chars", i, len(embeds[i].Title), maxTitleLen)
+			embeds[i].Title = truncateString(embeds[i].Title, maxTitleLen)
+		}
+		if len(embeds[i].Description) > maxDescLen {
+			log.Printf("sanitizing embed %d description (len=%d) to %d chars", i, len(embeds[i].Description), maxDescLen)
+			embeds[i].Description = truncateString(embeds[i].Description, maxDescLen)
+		}
+		if len(embeds[i].Fields) > maxFields {
+			log.Printf("sanitizing embed %d fields: trimming %d fields to %d", i, len(embeds[i].Fields)-maxFields, maxFields)
+			embeds[i].Fields = embeds[i].Fields[:maxFields]
+		}
+		for j := range embeds[i].Fields {
+			if len(embeds[i].Fields[j].Name) > maxFieldName {
+				embeds[i].Fields[j].Name = truncateString(embeds[i].Fields[j].Name, maxFieldName)
+			}
+			if len(embeds[i].Fields[j].Value) > maxFieldValue {
+				embeds[i].Fields[j].Value = truncateString(embeds[i].Fields[j].Value, maxFieldValue)
+			}
+		}
+	}
+	return embeds
+}
+
+func truncateString(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	if max <= 3 {
+		return s[:max]
+	}
+	return s[:max-3] + "..."
 }
 
 func addOverrideFields(discordMessage *DiscordMessage) {
