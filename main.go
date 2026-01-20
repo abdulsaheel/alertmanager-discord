@@ -238,32 +238,60 @@ func postMessageToDiscord(alertManagerData *AlertManagerData, status string, col
 func sendToWebhook(webHook string, discordMessageBytes []byte) {
 	response, err := http.Post(webHook, "application/json", bytes.NewReader(discordMessageBytes))
 	if err != nil {
-		log.Printf("failed to POST to webhook %s: %v", webHook, err)
+		log.Printf("failed to POST to webhook: %v", err)
 		return
 	}
 	defer response.Body.Close()
-	// Success is indicated with 2xx status codes:
-	statusOK := response.StatusCode >= 200 && response.StatusCode < 300
-	if !statusOK {
-		responseData, err := ioutil.ReadAll(response.Body)
-		if err != nil {
-			log.Printf("failed to read response body: %v", err)
-			return
+
+	if response.StatusCode >= 200 && response.StatusCode < 300 {
+		return
+	}
+
+	responseData, err := ioutil.ReadAll(response.Body)
+	if err != nil {
+		log.Printf("failed to read response body: %v", err)
+		return
+	}
+
+	// Collect useful headers for diagnostics
+	headers := map[string]string{
+		"Retry-After":             response.Header.Get("Retry-After"),
+		"X-RateLimit-Limit":       response.Header.Get("X-RateLimit-Limit"),
+		"X-RateLimit-Remaining":   response.Header.Get("X-RateLimit-Remaining"),
+		"X-RateLimit-Reset":       response.Header.Get("X-RateLimit-Reset"),
+		"X-RateLimit-Reset-After": response.Header.Get("X-RateLimit-Reset-After"),
+		"X-Discord-Request-Id":    response.Header.Get("X-Discord-Request-Id"),
+	}
+	headerParts := make([]string, 0, len(headers))
+	for k, v := range headers {
+		if v != "" {
+			headerParts = append(headerParts, fmt.Sprintf("%s=%s", k, v))
 		}
-		// Try to parse discord JSON error to give actionable message
-		var discordErr map[string]interface{}
-		if err := json.Unmarshal(responseData, &discordErr); err == nil {
-			msg := ""
-			if m, ok := discordErr["message"].(string); ok {
-				msg = m
-			}
-			if e, ok := discordErr["errors"]; ok {
-				log.Printf("Webhook message to Discord failed (%d): %s - errors: %v", response.StatusCode, msg, e)
-			} else {
-				log.Printf("Webhook message to Discord failed (%d): %s", response.StatusCode, msg)
-			}
+	}
+	headerInfo := ""
+	if len(headerParts) > 0 {
+		headerInfo = " (" + strings.Join(headerParts, ", ") + ")"
+	}
+
+	// Try to parse JSON error body
+	var discordErr map[string]interface{}
+	if err := json.Unmarshal(responseData, &discordErr); err == nil {
+		msg := ""
+		if m, ok := discordErr["message"].(string); ok && m != "" {
+			msg = m
+		}
+		if e, ok := discordErr["errors"]; ok {
+			log.Printf("Webhook message to Discord failed (%d)%s: %s - errors: %v - raw: %s", response.StatusCode, headerInfo, msg, e, truncateString(string(responseData), 1024))
+		} else if msg != "" {
+			log.Printf("Webhook message to Discord failed (%d)%s: %s - raw: %s", response.StatusCode, headerInfo, msg, truncateString(string(responseData), 1024))
 		} else {
-			log.Printf("Webhook message to Discord failed (%d): %s", response.StatusCode, string(responseData))
+			log.Printf("Webhook message to Discord failed (%d)%s: parsed JSON but no message/errors - raw: %s", response.StatusCode, headerInfo, truncateString(string(responseData), 1024))
+		}
+	} else {
+		if len(responseData) == 0 {
+			log.Printf("Webhook message to Discord failed (%d)%s: empty response body", response.StatusCode, headerInfo)
+		} else {
+			log.Printf("Webhook message to Discord failed (%d)%s: %s", response.StatusCode, headerInfo, truncateString(string(responseData), 1024))
 		}
 	}
 }
@@ -328,6 +356,40 @@ func truncateString(s string, max int) string {
 		return s[:max]
 	}
 	return s[:max-3] + "..."
+}
+
+// sensitiveEnv returns true if the env var name looks sensitive and should be redacted
+func sensitiveEnv(name string) bool {
+	name = strings.ToUpper(name)
+	sensitiveKeywords := []string{"TOKEN", "KEY", "SECRET", "PASSWORD", "PASS", "WEBHOOK"}
+	for _, k := range sensitiveKeywords {
+		if strings.Contains(name, k) {
+			return true
+		}
+	}
+	return false
+}
+
+// logEnvVars logs all environment variables. Sensitive values are redacted by default.
+// To see full values, set DUMP_ENVS_FULL=true in the environment (use with caution).
+func logEnvVars() {
+	envs := os.Environ()
+	full := os.Getenv("DUMP_ENVS_FULL") == "true" || os.Getenv("DUMP_ENVS_FULL") == "1"
+	log.Printf("Environment variables (sensitive values redacted; set DUMP_ENVS_FULL=true to show full values). Count: %d", len(envs))
+	for _, e := range envs {
+		parts := strings.SplitN(e, "=", 2)
+		k := parts[0]
+		v := ""
+		if len(parts) > 1 {
+			v = parts[1]
+		}
+		if full || !sensitiveEnv(k) {
+			log.Printf("ENV %s=%s", k, v)
+		} else {
+			red := fmt.Sprintf("<redacted len=%d prefix=%s>", len(v), truncateString(v, 4))
+			log.Printf("ENV %s=%s", k, red)
+		}
+	}
 }
 
 func addOverrideFields(discordMessage *DiscordMessage) {
@@ -431,6 +493,8 @@ func sendRawPromAlertWarn() {
 
 func main() {
 	flag.Parse()
+	// Log environment variables for debugging. Sensitive values are redacted unless DUMP_ENVS_FULL=true
+	logEnvVars()
 	checkWebhookURL(*webhookURL)
 	for _, additionalWebhook := range strings.Split(*additionalWebhookURLFlag, ",") {
 		if isNotBlankOrEmpty(additionalWebhook) && checkWebhookURL(additionalWebhook) {
