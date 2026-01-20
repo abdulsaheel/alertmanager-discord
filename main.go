@@ -235,17 +235,36 @@ func postMessageToDiscord(alertManagerData *AlertManagerData, status string, col
 		log.Printf("Posting to primary webhook: %s", *webhookURL)
 		log.Printf("Payload: %s", string(discordMessageBytes))
 	}
-	sendToWebhook(*webhookURL, discordMessageBytes)
+	status, respBody, err := sendToWebhook(*webhookURL, discordMessageBytes)
+	if err != nil {
+		log.Printf("error sending to primary webhook: %v", err)
+	}
+	if dumpFull && status >= 400 {
+		// If Discord complains about embeds we can try isolating which embed fails
+		if bytes.Contains(respBody, []byte("\"embeds\"")) {
+			log.Printf("Attempting embed isolation diagnostics for primary webhook")
+			debugIsolateEmbeds(*webhookURL, discordMessageBytes, discordMessage.Embeds)
+		}
+	}
 	for _, webhook := range additionalWebhookURLs {
 		if dumpFull {
 			log.Printf("Posting to additional webhook: %s", webhook)
 			log.Printf("Payload: %s", string(discordMessageBytes))
 		}
-		sendToWebhook(webhook, discordMessageBytes)
+		status, respBody, err := sendToWebhook(webhook, discordMessageBytes)
+		if err != nil {
+			log.Printf("error sending to additional webhook %s: %v", webhook, err)
+		}
+		if dumpFull && status >= 400 {
+			if bytes.Contains(respBody, []byte("\"embeds\"")) {
+				log.Printf("Attempting embed isolation diagnostics for additional webhook %s", webhook)
+				debugIsolateEmbeds(webhook, discordMessageBytes, discordMessage.Embeds)
+			}
+		}
 	}
 }
 
-func sendToWebhook(webHook string, discordMessageBytes []byte) {
+func sendToWebhook(webHook string, discordMessageBytes []byte) (int, []byte, error) {
 	// If DUMP_ENVS_FULL is set, print the webhook URL and payload before sending
 	dumpFull := os.Getenv("DUMP_ENVS_FULL") == "true" || os.Getenv("DUMP_ENVS_FULL") == "1"
 	if dumpFull {
@@ -256,18 +275,18 @@ func sendToWebhook(webHook string, discordMessageBytes []byte) {
 	response, err := http.Post(webHook, "application/json", bytes.NewReader(discordMessageBytes))
 	if err != nil {
 		log.Printf("failed to POST to webhook: %v", err)
-		return
+		return 0, nil, err
 	}
 	defer response.Body.Close()
 
 	if response.StatusCode >= 200 && response.StatusCode < 300 {
-		return
+		return response.StatusCode, nil, nil
 	}
 
 	responseData, err := ioutil.ReadAll(response.Body)
 	if err != nil {
 		log.Printf("failed to read response body: %v", err)
-		return
+		return response.StatusCode, nil, err
 	}
 
 	// Collect useful headers for diagnostics
@@ -311,6 +330,7 @@ func sendToWebhook(webHook string, discordMessageBytes []byte) {
 			log.Printf("Webhook message to Discord failed (%d)%s: %s", response.StatusCode, headerInfo, truncateString(string(responseData), 1024))
 		}
 	}
+	return response.StatusCode, responseData, nil
 }
 
 func buildDiscordMessage(alertManagerData *AlertManagerData, status string, numberOfAlerts int, color int) DiscordMessage {
@@ -341,14 +361,17 @@ func sanitizeEmbeds(embeds DiscordEmbeds) DiscordEmbeds {
 		embeds = embeds[:maxEmbeds]
 	}
 	for i := range embeds {
+		// Title
 		if len(embeds[i].Title) > maxTitleLen {
 			log.Printf("sanitizing embed %d title (len=%d) to %d chars", i, len(embeds[i].Title), maxTitleLen)
 			embeds[i].Title = truncateString(embeds[i].Title, maxTitleLen)
 		}
+		// Description
 		if len(embeds[i].Description) > maxDescLen {
 			log.Printf("sanitizing embed %d description (len=%d) to %d chars", i, len(embeds[i].Description), maxDescLen)
 			embeds[i].Description = truncateString(embeds[i].Description, maxDescLen)
 		}
+		// Fields
 		if len(embeds[i].Fields) > maxFields {
 			log.Printf("sanitizing embed %d fields: trimming %d fields to %d", i, len(embeds[i].Fields)-maxFields, maxFields)
 			embeds[i].Fields = embeds[i].Fields[:maxFields]
@@ -361,8 +384,25 @@ func sanitizeEmbeds(embeds DiscordEmbeds) DiscordEmbeds {
 				embeds[i].Fields[j].Value = truncateString(embeds[i].Fields[j].Value, maxFieldValue)
 			}
 		}
+		// Validate URL scheme - Discord accepts http/https. If invalid, clear it.
+		if embeds[i].URL != "" {
+			if !isValidHTTPURL(embeds[i].URL) {
+				log.Printf("sanitizing embed %d URL (invalid scheme or format): %s", i, embeds[i].URL)
+				embeds[i].URL = ""
+			}
+		}
 	}
 	return embeds
+}
+
+// isValidHTTPURL returns true if the URL parses and uses http or https scheme
+func isValidHTTPURL(u string) bool {
+	parsed, err := url.Parse(u)
+	if err != nil {
+		return false
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	return scheme == "http" || scheme == "https"
 }
 
 func truncateString(s string, max int) string {
@@ -373,6 +413,38 @@ func truncateString(s string, max int) string {
 		return s[:max]
 	}
 	return s[:max-3] + "..."
+}
+
+// debugIsolateEmbeds will attempt to send each embed individually to the webhook and log the results.
+// This is only intended for interactive debugging when DUMP_ENVS_FULL is enabled.
+func debugIsolateEmbeds(webhook string, fullPayload []byte, embeds DiscordEmbeds) {
+	for i := range embeds {
+		// Build a message with only the header and the single embed to test
+		testMsg := DiscordMessage{}
+		addOverrideFields(&testMsg)
+		// include header as empty so we can reproduce structure similar to the original
+		if len(embeds) > 0 {
+			testHeader := embeds[0]
+			testMsg.Embeds = DiscordEmbeds{testHeader}
+		}
+		// Replace the header or append the single embed we want to test
+		if len(testMsg.Embeds) > 0 {
+			testMsg.Embeds[0] = embeds[i]
+		} else {
+			testMsg.Embeds = DiscordEmbeds{embeds[i]}
+		}
+		testBytes, _ := json.Marshal(testMsg)
+		log.Printf("[embed isolation] Posting single embed index %d to %s", i, webhook)
+		log.Printf("[embed isolation] Payload: %s", string(testBytes))
+		status, respBody, err := sendToWebhook(webhook, testBytes)
+		if err != nil {
+			log.Printf("[embed isolation] POST error for embed %d: %v", i, err)
+			continue
+		}
+		log.Printf("[embed isolation] embed %d -> status=%d, resp=%s", i, status, truncateString(string(respBody), 1024))
+		// Sleep briefly to avoid triggering rate limits
+		time.Sleep(500 * time.Millisecond)
+	}
 }
 
 // sensitiveEnv returns true if the env var name looks sensitive and should be redacted
